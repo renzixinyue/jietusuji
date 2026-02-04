@@ -1,10 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { Layout, Menu, Button, Upload, Card, Typography, Spin, message, Input, Space, Tag } from 'antd';
-import { UploadOutlined, DeleteOutlined, SaveOutlined, DownloadOutlined, PlusOutlined } from '@ant-design/icons';
+import { Layout, Menu, Button, Upload, Card, Typography, Spin, message, Input, Space, Tag, Modal, Form } from 'antd';
+import { UploadOutlined, DeleteOutlined, SaveOutlined, DownloadOutlined, PlusOutlined, SettingOutlined } from '@ant-design/icons';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db, Note } from './db';
 import { recognizeImage } from './utils/ocr';
 import { extractInfo } from './utils/extractor';
+import { analyzeImageWithGemini } from './utils/llm';
 
 const { Content, Sider } = Layout;
 const { Title, Text } = Typography;
@@ -17,6 +18,8 @@ const App: React.FC = () => {
   const [editingNote, setEditingNote] = useState<Note | null>(null);
   const [inputVisible, setInputVisible] = useState(false);
   const [inputValue, setInputValue] = useState('');
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_api_key') || '');
 
   useEffect(() => {
     if (selectedNoteId && notes) {
@@ -26,6 +29,23 @@ const App: React.FC = () => {
       setEditingNote(null);
     }
   }, [selectedNoteId, notes]);
+
+  // Paste Event Listener
+  useEffect(() => {
+    const handlePaste = (event: ClipboardEvent) => {
+      const items = event.clipboardData?.items;
+      if (items) {
+        for (let i = 0; i < items.length; i++) {
+          if (items[i].type.indexOf('image') !== -1) {
+            const blob = items[i].getAsFile();
+            if (blob) handleUpload(blob);
+          }
+        }
+      }
+    };
+    window.addEventListener('paste', handlePaste);
+    return () => window.removeEventListener('paste', handlePaste);
+  }, [apiKey]); // Re-bind if API key changes (though handleUpload reads state directly, dependency here ensures freshness if closure issues arise)
 
   const handleClose = (removedTag: string) => {
     if (!editingNote) return;
@@ -55,10 +75,7 @@ const App: React.FC = () => {
   const handleUpload = async (file: File) => {
     setLoading(true);
     try {
-      const text = await recognizeImage(file);
-      const info = extractInfo(text);
-      
-      // Convert image to Base64
+      // Convert image to Base64 first (needed for both DB and LLM)
       const reader = new FileReader();
       const base64Image = await new Promise<string>((resolve, reject) => {
         reader.onload = () => resolve(reader.result as string);
@@ -66,6 +83,36 @@ const App: React.FC = () => {
         reader.readAsDataURL(file);
       });
 
+      let text = "";
+      let info = {
+        urls: [] as string[],
+        emails: [] as string[],
+        keywords: [] as string[],
+        sentences: [] as string[],
+        suggestedTitle: "New Note"
+      };
+
+      if (apiKey) {
+        // Use Gemini LLM
+        try {
+            message.info("Analyzing with Gemini AI...");
+            const result = await analyzeImageWithGemini(apiKey, base64Image);
+            text = result.summary; // Use summary as main content
+            info = result.extractedInfo;
+        } catch (err) {
+            console.error("Gemini failed, falling back to OCR", err);
+            message.warning("AI Analysis failed, falling back to OCR.");
+            // Fallback to OCR
+            text = await recognizeImage(file);
+            info = extractInfo(text);
+        }
+      } else {
+        // Use OCR
+        message.info("Processing with local OCR...");
+        text = await recognizeImage(file);
+        info = extractInfo(text);
+      }
+      
       const newNote: Note = {
         title: info.suggestedTitle,
         content: text,
@@ -120,10 +167,13 @@ const App: React.FC = () => {
     <Layout style={{ minHeight: '100vh' }}>
       <Sider theme="light" width={300} style={{ borderRight: '1px solid #f0f0f0' }}>
         <div style={{ padding: '16px', borderBottom: '1px solid #f0f0f0' }}>
-          <Title level={4}>Screenshot Notes</Title>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <Title level={4} style={{ margin: 0 }}>Screenshot Notes</Title>
+            <Button icon={<SettingOutlined />} onClick={() => setIsSettingsOpen(true)} />
+          </div>
           <Space>
             <Upload beforeUpload={handleUpload} showUploadList={false} accept="image/*">
-                <Button icon={<UploadOutlined />} type="primary" loading={loading}>Upload Screenshot</Button>
+                <Button icon={<UploadOutlined />} type="primary" loading={loading}>Upload / Paste</Button>
             </Upload>
             <Button icon={<DownloadOutlined />} onClick={handleExport} title="Export Data" />
           </Space>
@@ -226,6 +276,27 @@ const App: React.FC = () => {
           )}
         </Content>
       </Layout>
+
+      <Modal
+        title="Settings"
+        open={isSettingsOpen}
+        onOk={() => {
+            localStorage.setItem('gemini_api_key', apiKey);
+            setIsSettingsOpen(false);
+            message.success('API Key saved');
+        }}
+        onCancel={() => setIsSettingsOpen(false)}
+      >
+        <Form layout="vertical">
+            <Form.Item label="Google Gemini API Key" help="Required for AI summarization. Get one for free at aistudio.google.com">
+                <Input.Password 
+                    value={apiKey} 
+                    onChange={e => setApiKey(e.target.value)} 
+                    placeholder="Enter your API Key here"
+                />
+            </Form.Item>
+        </Form>
+      </Modal>
     </Layout>
   );
 };
